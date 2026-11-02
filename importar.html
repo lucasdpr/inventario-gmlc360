@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Importar · Inventário GMLC 360°</title>
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+<!-- Ferramenta de uso único: copia o inventário do sistema antigo (OMS) para o Supabase. Pode rodar mais de uma vez sem duplicar. -->
+<div class="login" style="max-width:520px">
+  <div class="rotulo">Inventário GMLC 360°</div>
+  <h1>Copiar do sistema antigo</h1>
+  <p>Copia fotos, respostas e o link do inventário que está no OMS para o banco novo. Pode repetir sem duplicar nada.</p>
+  <h2 style="font-size:1rem;margin:14px 0 4px">1. Login novo (Supabase)</h2>
+  <label>E-mail<input id="n-email" type="email" autocomplete="username"></label>
+  <label>Senha<input id="n-senha" type="password" autocomplete="current-password"></label>
+  <h2 style="font-size:1rem;margin:14px 0 4px">2. Login antigo (OMS)</h2>
+  <label>Matrícula<input id="o-mat" autocapitalize="characters"></label>
+  <label>Senha<input id="o-senha" type="password"></label>
+  <div class="erro" id="erro" role="alert"></div>
+  <button type="button" class="btn btn-pri" id="ir">Copiar tudo</button>
+  <pre id="log" style="white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;margin-top:14px"></pre>
+</div>
+<script src="supa.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const ANTIGA = 'https://api-oms-csn.onrender.com';
+  const log = t => { $('log').textContent += t + '\n'; $('log').scrollIntoView({ block: 'end' }); };
+  const iso = s => (s ? String(s).replace(' ', 'T') + '-03:00' : null); // o sistema antigo gravava a hora de Brasília
+  const rnd = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  async function velha(caminho, tok) {
+    const r = await fetch(ANTIGA + caminho, { cache: 'no-store', headers: tok ? { Authorization: `Bearer ${tok}` } : {} });
+    if (!r.ok) throw new Error(`${caminho}: erro ${r.status}`);
+    return r;
+  }
+  async function copiar() {
+    $('erro').textContent = ''; $('log').textContent = ''; $('ir').disabled = true;
+    try {
+      log('Entrando no banco novo…');
+      const d = await SB.entrar($('n-email').value.trim().toLowerCase(), $('n-senha').value);
+      const T = d.access_token;
+      if (!(await SB.rpc('inv_is_admin', {}, T))) throw new Error('Este e-mail não é administrador do inventário.');
+      log('Entrando no OMS (pode demorar se o servidor estava dormindo)…');
+      const lr = await fetch(`${ANTIGA}/api/colaboradores/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ matricula: $('o-mat').value.trim().toUpperCase(), senha: $('o-senha').value }) });
+      const ld = await lr.json().catch(() => ({}));
+      if (!lr.ok) throw new Error('OMS: ' + (ld.detail || lr.status));
+      if (!ld.is_adm) throw new Error('A matrícula do OMS precisa ser de administrador.');
+      const O = ld.token;
+      const lotes = await (await velha('/api/inventario/lotes', O)).json();
+      for (const lo of lotes) {
+        log(`\nInventário "${lo.nome}"`);
+        let [novo] = await SB.tabela('GET', `inv_lotes?token=eq.${encodeURIComponent(lo.token)}`, undefined, T);
+        if (!novo) [novo] = await SB.tabela('POST', 'inv_lotes', { nome: lo.nome, token: lo.token }, T, { Prefer: 'return=representation' });
+        const pub = await (await velha(`/api/inventario/publico/${encodeURIComponent(lo.token)}`)).json();
+        const existentes = await SB.tabela('GET', `inv_itens?lote_id=eq.${novo.id}&select=id,numero,foto_path`, undefined, T);
+        const porNumero = new Map(existentes.map(x => [x.numero, x]));
+        let nItens = 0, nFotos = 0, nResp = 0;
+        for (const it of pub.itens) {
+          const campos = { nome: it.nome, codigo_sap: it.codigo_sap, onde_usa: it.onde_usa, quantidade: it.quantidade, unidade: it.unidade, observacao: it.observacao, nao_sei: !!it.nao_sei,
+            preenchido_por: it.preenchido_por, preenchido_em: iso(it.preenchido_em), confirmado: !!it.confirmado, foto_rev: it.foto_rev || 0 };
+          let alvo = porNumero.get(it.numero);
+          if (!alvo) {
+            const foto = await (await velha(`/api/inventario/publico/${encodeURIComponent(lo.token)}/foto/${it.id}`)).blob();
+            const caminho = `l${novo.id}/${rnd()}.jpg`;
+            await SB.enviarFoto(caminho, foto.type ? foto : new Blob([foto], { type: 'image/jpeg' }), T); nFotos++;
+            [alvo] = await SB.tabela('POST', 'inv_itens', { lote_id: novo.id, numero: it.numero, foto_path: caminho, ...campos }, T, { Prefer: 'return=representation' });
+          } else {
+            await SB.tabela('PATCH', `inv_itens?id=eq.${alvo.id}`, campos, T, { Prefer: 'return=minimal' });
+          }
+          nItens++;
+          // respostas (só o ADM do OMS enxerga todas)
+          const antigas = it.n_respostas > 0 ? await (await velha(`/api/inventario/itens/${it.id}/respostas`, O)).json() : [];
+          if (antigas.length) {
+            const jaTem = await SB.tabela('GET', `inv_respostas?item_id=eq.${alvo.id}&select=id,por,em`, undefined, T);
+            const chave = (por, em) => `${por}|${new Date(em).getTime()}`;
+            const mapa = new Map(jaTem.map(r => [chave(r.por, r.em), r.id]));
+            for (const r of antigas.slice().reverse()) { // do mais antigo para o mais novo
+              const k = chave(r.por, iso(r.em));
+              if (!mapa.has(k)) {
+                const [n] = await SB.tabela('POST', 'inv_respostas', { item_id: alvo.id, nome: r.nome, codigo_sap: r.codigo_sap, onde_usa: r.onde_usa, quantidade: r.quantidade, unidade: r.unidade, observacao: r.observacao, nao_sei: !!r.nao_sei, por: r.por, em: iso(r.em) }, T, { Prefer: 'return=representation' });
+                mapa.set(k, n.id); nResp++;
+              }
+            }
+            if (it.resposta_escolhida) {
+              const esc = antigas.find(r => r.id === it.resposta_escolhida);
+              const nid = esc && mapa.get(chave(esc.por, iso(esc.em)));
+              if (nid) await SB.tabela('PATCH', `inv_itens?id=eq.${alvo.id}`, { resposta_escolhida: nid }, T, { Prefer: 'return=minimal' });
+            }
+          }
+          if (nItens % 10 === 0) log(`  ${nItens} de ${pub.itens.length} itens…`);
+        }
+        log(`✓ ${nItens} itens (${nFotos} fotos novas, ${nResp} respostas novas). Link: ?t=${lo.token}`);
+      }
+      log('\nPRONTO. Confira o painel do ADM e avise o Claude.');
+    } catch (e) { $('erro').textContent = e.message; log('Parou: ' + e.message + '\nPode tocar em "Copiar tudo" de novo: o que já foi copiado não duplica.'); }
+    finally { $('ir').disabled = false; }
+  }
+  $('ir').onclick = copiar;
+})();
+</script>
+</body>
+</html>
