@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#141b29">
+<title>ADM · Inventário GMLC 360°</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+<!-- Parte do ADM: não tem link na página pública. Entra com a matrícula e a senha do OMS; só ADM passa. -->
+<div id="tela-login" class="login" hidden>
+  <div class="rotulo">Inventário GMLC 360°</div>
+  <h1>Área do ADM</h1>
+  <p>Entre com a mesma matrícula e senha do OMS. Só administradores têm acesso a esta parte.</p>
+  <label>Matrícula<input id="l-mat" autocomplete="username" autocapitalize="characters" maxlength="20"></label>
+  <label>Senha<input id="l-senha" type="password" autocomplete="current-password" maxlength="80"></label>
+  <div class="erro" id="l-erro" role="alert"></div>
+  <button type="button" class="btn btn-pri" id="l-entrar">Entrar</button>
+</div>
+
+<div id="tela-adm" hidden>
+  <header class="adm-topo"><div><div class="rotulo">Área do ADM</div><h1>Inventário GMLC 360°</h1></div><button type="button" class="sair" id="sair">Sair</button></header>
+  <main class="adm-main" id="corpo"><div class="vazio">Carregando…</div></main>
+</div>
+
+<div class="zoom-tela hidden" id="zoom"><img alt="Foto ampliada"><button type="button" aria-label="Fechar">✕</button></div>
+<div class="aviso hidden" id="aviso" role="status"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const n3 = n => String(n).padStart(3, '0');
+  const NOME_UNID = { CDA: 'CDA', L: 'litro', KG: 'kg', M: 'm', 'pç': 'peça', m: 'm', cx: 'caixa', kg: 'kg', rolo: 'rolo', par: 'par', jogo: 'jogo', l: 'litro' };
+  const ler = k => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
+  const gravar = (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { /* sem armazenamento: pede o login de novo */ } };
+  let API = '', SESSAO = null, LOTES = [], LOTE = null, ITENS = [], FILTRO = 'todos', ENVIANDO = false;
+
+  async function base() {
+    if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+      try { const r = await fetch('http://localhost:8000/', { signal: AbortSignal.timeout(1500) }); if (r.ok) return 'http://localhost:8000'; } catch { /* segue */ }
+    }
+    return 'https://api-oms-csn.onrender.com';
+  }
+  let timerAviso;
+  function avisar(t) { const a = $('aviso'); a.textContent = t; a.classList.remove('hidden'); clearTimeout(timerAviso); timerAviso = setTimeout(() => a.classList.add('hidden'), 3200); }
+  const situacao = i => ((i.codigo_sap || '').trim() ? 'ok' : i.nao_sei ? 'ns' : 'falta');
+  const linkPublico = (l, i) => `${location.origin}${location.pathname.replace(/[^/]*$/, '')}?t=${encodeURIComponent(l.token)}${i ? `&i=${i}` : ''}`;
+  const fotoUrl = i => `${API}/api/inventario/publico/${encodeURIComponent(LOTE.token)}/foto/${i.id}?r=${i.foto_rev || 0}`;
+
+  // Janelas do site (no lugar do alert/confirm do navegador)
+  function janela(html) {
+    return new Promise(resolve => {
+      const m = document.createElement('div'); m.className = 'modal'; m.setAttribute('role', 'dialog'); m.setAttribute('aria-modal', 'true');
+      m.innerHTML = `<div class="caixa larga">${html}</div>`; document.body.appendChild(m);
+      const fim = v => { m.remove(); resolve(v); };
+      m.addEventListener('click', e => { if (e.target === m) fim(null); });
+      resolve.fim = fim; m.fim = fim; janela.atual = m;
+    });
+  }
+  async function confirmar(texto, ok = 'Confirmar') {
+    const p = janela(`<h2>${esc(texto)}</h2><div class="rodape-modal"><button type="button" class="bt" data-r="0">Cancelar</button><button type="button" class="bt bt-pri" data-r="1">${esc(ok)}</button></div>`);
+    janela.atual.addEventListener('click', e => { const b = e.target.closest('[data-r]'); if (b) janela.atual.fim(b.dataset.r === '1'); });
+    return (await p) === true;
+  }
+  async function perguntar(texto) {
+    const p = janela(`<h2>${esc(texto)}</h2><input id="j-txt" maxlength="120"><div class="rodape-modal"><button type="button" class="bt" data-r="0">Cancelar</button><button type="button" class="bt bt-pri" data-r="1">OK</button></div>`);
+    const m = janela.atual; setTimeout(() => m.querySelector('#j-txt').focus(), 30);
+    m.addEventListener('click', e => { const b = e.target.closest('[data-r]'); if (b) m.fim(b.dataset.r === '1' ? m.querySelector('#j-txt').value.trim() : null); });
+    return await p;
+  }
+
+  async function pedir(caminho, opcoes = {}) {
+    const r = await fetch(`${API}${caminho}`, { cache: 'no-store', ...opcoes, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SESSAO.token}`, ...(opcoes.headers || {}) } });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 401) { sair(); throw new Error('Sua sessão acabou. Entre de novo.'); }
+    if (!r.ok) throw new Error(d.detail || `A API respondeu ${r.status}`);
+    return d;
+  }
+
+  // ---------- login ----------
+  async function entrar() {
+    const mat = $('l-mat').value.trim().toUpperCase(), senha = $('l-senha').value;
+    $('l-erro').textContent = '';
+    if (!mat || !senha) { $('l-erro').textContent = 'Digite a matrícula e a senha.'; return; }
+    $('l-entrar').disabled = true;
+    try {
+      const r = await fetch(`${API}/api/colaboradores/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ matricula: mat, senha }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `Erro ${r.status}`);
+      if (d.precisa_definir_senha) throw new Error('Defina sua senha primeiro, entrando uma vez no OMS.');
+      if (!d.is_adm) throw new Error('Esta parte é só para administradores.');
+      SESSAO = { token: d.token, nome: d.nome, matricula: mat };
+      gravar('inv_adm', JSON.stringify(SESSAO));
+      abrirPainel();
+    } catch (e) { $('l-erro').textContent = e.message; }
+    finally { $('l-entrar').disabled = false; }
+  }
+  function sair() { SESSAO = null; gravar('inv_adm', ''); $('tela-adm').hidden = true; $('tela-login').hidden = false; $('l-senha').value = ''; }
+
+  // ---------- fotos ----------
+  function reduzir(arquivo) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(arquivo), img = new Image();
+      img.onload = () => {
+        const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+        const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+        let q = 0.78, d = c.toDataURL('image/jpeg', q);
+        while (d.length > 1_400_000 && q > 0.4) { q -= 0.1; d = c.toDataURL('image/jpeg', q); }
+        resolve(d);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`${arquivo.name}: não é uma imagem que o celular consiga abrir`)); };
+      img.src = url;
+    });
+  }
+  async function carregarItens() { const d = await pedir(`/api/inventario/publico/${encodeURIComponent(LOTE.token)}`); ITENS = d.itens; LOTE.resumo = d.resumo; }
+
+  async function subir(arquivos) {
+    if (!arquivos.length || ENVIANDO) return;
+    arquivos = arquivos.slice().sort((a, b) => a.name.localeCompare(b.name, 'pt-BR', { numeric: true }));
+    ENVIANDO = true; const falhas = [];
+    const status = t => { const e = $('mi-envio'); if (e) e.innerHTML = t; };
+    desenhar();
+    const sair = e => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', sair);
+    for (let k = 0; k < arquivos.length; k++) {
+      status(`<div class="mi-envio-barra"><i style="width:${k / arquivos.length * 100}%"></i></div>Enviando ${k + 1} de ${arquivos.length}… não feche esta tela.`);
+      try {
+        const foto = await reduzir(arquivos[k]);
+        let ok = false, erro;
+        for (let t = 0; t < 3 && !ok; t++) { // rede ruim: tenta de novo antes de desistir
+          try { await pedir(`/api/inventario/lotes/${LOTE.id}/itens`, { method: 'POST', body: JSON.stringify({ foto, por: SESSAO.nome }) }); ok = true; }
+          catch (e) { erro = e; await new Promise(r => setTimeout(r, 1500)); }
+        }
+        if (!ok) throw erro;
+      } catch (e) { falhas.push(`${arquivos[k].name}: ${e.message}`); }
+    }
+    window.removeEventListener('beforeunload', sair); ENVIANDO = false;
+    await carregarItens().catch(() => {});
+    const n = arquivos.length - falhas.length;
+    desenhar(falhas.length
+      ? `<div class="mi-envio-erro">${n} enviada${n === 1 ? '' : 's'}. ${falhas.length} não foi${falhas.length === 1 ? '' : 'ram'}: selecione de novo só ${falhas.length === 1 ? 'essa' : 'essas'}.<br><small>${falhas.slice(0, 5).map(esc).join('<br>')}</small></div>`
+      : `<div class="mi-envio-ok">✓ ${n} foto${n === 1 ? '' : 's'} enviada${n === 1 ? '' : 's'}.</div>`);
+  }
+
+  // ---------- mensagem do WhatsApp ----------
+  const mensagemDe = link => `*Inventário GMLC 360°*
+
+Olá! Estamos levantando o material que veio da gerência para a oficina. Ele está sem código, e precisamos da ajuda de vocês da manutenção para identificar cada item.
+
+*Como fazer (cerca de 1 minuto por foto):*
+1. Abra o link abaixo. Não precisa de login nem de senha.
+2. Escreva seu nome e sua matrícula (só na primeira vez).
+3. Você vai ver uma foto por vez. Se o material for da *sua área*, preencha:
+   • *Nome* do material
+   • *Código SAP*
+   • *Onde usa* (qual equipamento ou máquina)
+   • *Quantidade* e a unidade (CDA, litro, kg ou metro), se souber
+4. Toque em *Salvar e próximo*.
+5. Não é da sua área ou não sabe o código? Toque em *Não sei o código* (ou passe para o lado com o dedo). Outra pessoa de outra área preenche.
+
+*Dicas:*
+• Para ampliar a foto, toque nela.
+• Foto de cabeça para baixo? Toque em "Virar de cabeça para cima".
+• Se alguém já respondeu e você sabe que é outro código, pode responder também: as duas respostas ficam guardadas e a oficina confere.
+• Pode parar e voltar depois: o que você salvou fica gravado.
+• Se demorar para abrir, espere uns segundos e recarregue.
+
+Link: ${link}
+
+Qualquer dúvida, fale com a oficina. Obrigado!`;
+
+  // ---------- tela ----------
+  function desenhar(msg = '') {
+    const el = $('corpo');
+    if (!LOTE) { el.innerHTML = '<div class="vazio">Carregando…</div>'; return; }
+    const r = LOTE.resumo || { total: 0, com_codigo: 0, nao_sei: 0, faltam: 0 }, t = r.total || 1;
+    const conta = s => ITENS.filter(i => situacao(i) === s).length;
+    const vis = ITENS.filter(i => FILTRO === 'todos' || situacao(i) === FILTRO);
+    const chip = (k, txt) => `<button type="button" data-f="${k}" class="${FILTRO === k ? 'on' : ''}">${txt}</button>`;
+    const link = linkPublico(LOTE);
+    el.innerHTML = `
+      ${LOTES.length > 1 ? `<select id="mi-lote" aria-label="Inventário" style="width:100%;min-height:44px;margin-bottom:10px;border-radius:12px;border:1px solid var(--linha-forte);background:var(--bloco);padding:0 10px">${LOTES.map(l => `<option value="${l.id}"${l.id === LOTE.id ? ' selected' : ''}>${esc(l.nome)}</option>`).join('')}</select>` : ''}
+      <div class="mi-topo"><div><div class="rotulo">Inventário</div><h2 class="mi-nome">${esc(LOTE.nome)}</h2></div><button type="button" class="bt" data-a="novo">+ Novo inventário</button></div>
+      <div class="mi-prog"><div class="mi-barra"><i style="width:${r.com_codigo / t * 100}%;background:var(--ok)"></i><i style="width:${r.nao_sei / t * 100}%;background:var(--ambar)"></i></div>
+        <div class="mi-prog-txt"><span><b>${r.total}</b> materiais</span><span class="ok"><b>${r.com_codigo}</b> com código</span><span class="ns"><b>${r.nao_sei}</b> não sabem</span><span><b>${r.faltam}</b> faltam</span>${r.divergentes ? `<span class="dv"><b>${r.divergentes}</b> para conferir</span>` : ''}</div></div>
+      <div class="mi-passos">
+        <div class="mi-passo"><b>1</b><div><strong>Subir as fotos</strong><span>Selecione todas da galeria de uma vez. Cada foto vira um material numerado.</span>
+          <label class="bt bt-pri${ENVIANDO ? ' desligado' : ''}"><input type="file" accept="image/*" multiple hidden id="mi-arquivos"${ENVIANDO ? ' disabled' : ''}>Adicionar fotos</label>
+          <div id="mi-envio" class="mi-envio">${msg}</div></div></div>
+        <div class="mi-passo"><b>2</b><div><strong>Mandar o link para a manutenção</strong><span>Abre sem login. Eles veem uma foto por vez e preenchem nome, código SAP e onde usa.</span>
+          <div class="mi-link"><input readonly value="${esc(link)}" id="mi-link-txt" aria-label="Link"><button type="button" class="bt" data-a="copiar">Copiar</button></div>
+          <div class="mi-link-acoes"><a class="bt" href="https://wa.me/?text=${encodeURIComponent(mensagemDe(link))}" target="_blank" rel="noopener">Enviar no WhatsApp</a><button type="button" class="bt" data-a="copiarmsg">Copiar mensagem</button><a class="bt" href="${esc(link)}" target="_blank" rel="noopener">Abrir</a></div></div></div>
+        <div class="mi-passo"><b>3</b><div><strong>Baixar a planilha</strong><span>Com tudo que foi preenchido (e todas as respostas), para dar entrada no SAP.</span>
+          <button type="button" class="bt" data-a="excel"${r.total ? '' : ' disabled'}>Baixar Excel</button></div></div>
+      </div>
+      ${ITENS.length ? `<div class="filtros">${chip('todos', `Todos ${ITENS.length}`)}${chip('falta', `Faltam ${conta('falta')}`)}${chip('ns', `Não sabem ${conta('ns')}`)}${chip('ok', `Com código ${conta('ok')}`)}</div>
+      <div class="mi-grade">${vis.map(i => `<div class="mi-cel" data-sit="${situacao(i)}">
+        <a href="${esc(linkPublico(LOTE, i.id))}" target="_blank" rel="noopener" title="Abrir esta foto (para girar ou preencher)"><img loading="lazy" src="${fotoUrl(i)}" alt="Material ${n3(i.numero)}"></a>
+        <div><b>${n3(i.numero)}</b>${i.divergente && !i.confirmado ? `<button type="button" class="mi-diverge" data-a="respostas" data-id="${i.id}">⚠ Códigos diferentes: conferir</button>` : i.n_respostas > 1 && !i.confirmado ? `<button type="button" class="mi-mais" data-a="respostas" data-id="${i.id}">${i.n_respostas} respostas</button>` : ''}<span>${esc(i.nome || (situacao(i) === 'falta' ? 'Falta preencher' : '—'))}</span><span class="mi-cod">${i.codigo_sap ? `SAP ${esc(i.codigo_sap)}` : situacao(i) === 'ns' ? 'Não sabem o código' : ''}</span>
+          ${i.onde_usa ? `<span>${esc(i.onde_usa)}</span>` : ''}${i.quantidade != null ? `<span>${String(i.quantidade).replace('.', ',')} ${esc(NOME_UNID[i.unidade] || i.unidade || '')}</span>` : ''}${i.preenchido_por ? `<small>${esc(i.preenchido_por)}</small>` : ''}</div>
+        <button type="button" class="mi-tirar" data-a="tirar" data-id="${i.id}" aria-label="Tirar ${n3(i.numero)}" title="Tirar (foto repetida ou errada)">✕</button></div>`).join('') || '<div class="vazio">Nada com esse filtro.</div>'}</div>`
+      : '<div class="vazio">Nenhuma foto ainda. Comece pelo passo 1.</div>'}`;
+  }
+
+  async function agir(acao, alvo) {
+    try {
+      if (acao === 'respostas') {
+        const id = Number(alvo.dataset.id), item = ITENS.find(x => x.id === id);
+        const lista = await pedir(`/api/inventario/itens/${id}/respostas`);
+        const p = janela(`<div><div class="rotulo">Material ${n3(item.numero)}</div><h2>Respostas (${lista.length})</h2><p>Compare e toque em "Usar esta" na certa. Ela vira a resposta do material e as outras continuam guardadas no Excel.</p></div>
+          ${lista.map(r => `<div class="mi-resp"><div class="mi-resp-topo"><b>${esc(r.por)}</b><small>${esc(r.em.slice(8, 10))}/${esc(r.em.slice(5, 7))} ${esc(r.em.slice(11, 16))}</small></div>
+            <div><span>Nome</span> ${esc(r.nome || '—')}</div><div><span>Código SAP</span> <b>${esc(r.codigo_sap || (r.nao_sei ? 'não sabe' : '—'))}</b></div>
+            <div><span>Onde usa</span> ${esc(r.onde_usa || '—')}</div><div><span>Quantidade</span> ${r.quantidade != null ? `${String(r.quantidade).replace('.', ',')} ${esc(NOME_UNID[r.unidade] || r.unidade || '')}` : '—'}</div>
+            ${r.observacao ? `<div><span>Obs.</span> ${esc(r.observacao)}</div>` : ''}
+            <button type="button" class="bt bt-pri" data-e="${r.id}" style="align-self:stretch">Usar esta</button></div>`).join('')}
+          <div class="rodape-modal"><button type="button" class="bt" data-r="0">Fechar</button></div>`);
+        const m = janela.atual;
+        m.addEventListener('click', async e => {
+          if (e.target.closest('[data-r]')) return m.fim(null);
+          const b = e.target.closest('[data-e]'); if (!b) return;
+          try { await pedir(`/api/inventario/itens/${id}/escolher/${b.dataset.e}`, { method: 'POST' }); m.fim(true); await carregarItens(); desenhar(); }
+          catch (err) { avisar(err.message); }
+        });
+        return void await p;
+      }
+      if (acao === 'copiarmsg' || acao === 'copiar') {
+        const txt = acao === 'copiar' ? $('mi-link-txt').value : mensagemDe(linkPublico(LOTE));
+        try { await navigator.clipboard.writeText(txt); } catch { const t = document.createElement('textarea'); t.value = txt; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+        return avisar(acao === 'copiar' ? 'Link copiado.' : 'Mensagem copiada. Cole no grupo da manutenção.');
+      }
+      if (acao === 'tirar') {
+        const i = ITENS.find(x => x.id === Number(alvo.dataset.id)); if (!i) return;
+        if (!await confirmar(`Tirar o material ${n3(i.numero)} do inventário? (foto repetida ou errada)`, 'Tirar')) return;
+        await pedir(`/api/inventario/itens/${i.id}/remover`, { method: 'POST' }); await carregarItens(); return desenhar();
+      }
+      if (acao === 'novo') {
+        const nome = await perguntar('Nome do novo inventário'); if (!nome) return;
+        const l = await pedir('/api/inventario/lotes', { method: 'POST', body: JSON.stringify({ nome }) });
+        LOTES.push(l); LOTE = l; ITENS = []; return desenhar();
+      }
+      if (acao === 'excel') {
+        const r = await fetch(`${API}/api/inventario/lotes/${LOTE.id}/xlsx`, { headers: { Authorization: `Bearer ${SESSAO.token}` } });
+        if (!r.ok) throw new Error(`A API respondeu ${r.status}`);
+        const blob = await r.blob(), a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = `${LOTE.nome.replace(/[^\p{L}\p{N} _-]+/gu, '').trim() || 'inventario'}.xlsx`;
+        document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      }
+    } catch (e) { avisar(e.message); }
+  }
+
+  async function abrirPainel() {
+    $('tela-login').hidden = true; $('tela-adm').hidden = false;
+    try {
+      LOTES = await pedir('/api/inventario/lotes');
+      LOTE = (LOTE && LOTES.find(l => l.id === LOTE.id)) || LOTES[0];
+      desenhar(); await carregarItens(); desenhar();
+    } catch (e) { if (SESSAO) $('corpo').innerHTML = `<div class="vazio"><b>Não abriu.</b>${esc(e.message)}<br>Se o servidor estava dormindo, espere uns segundos e recarregue.</div>`; }
+  }
+
+  $('corpo').addEventListener('click', e => {
+    const f = e.target.closest('[data-f]'); if (f) { FILTRO = f.dataset.f; return desenhar(); }
+    const b = e.target.closest('[data-a]'); if (b) agir(b.dataset.a, b);
+  });
+  $('corpo').addEventListener('change', async e => {
+    if (e.target.id === 'mi-arquivos') { const lista = [...e.target.files]; e.target.value = ''; subir(lista); }
+    if (e.target.id === 'mi-lote') { LOTE = LOTES.find(l => l.id === Number(e.target.value)); ITENS = []; desenhar(); await carregarItens().catch(err => avisar(err.message)); desenhar(); }
+  });
+  $('l-entrar').onclick = entrar;
+  ['l-mat', 'l-senha'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') entrar(); }));
+  $('sair').onclick = sair;
+  $('zoom').onclick = () => $('zoom').classList.add('hidden');
+
+  (async () => {
+    API = await base();
+    try { SESSAO = JSON.parse(ler('inv_adm') || 'null'); } catch { SESSAO = null; }
+    if (SESSAO && SESSAO.token) abrirPainel(); else $('tela-login').hidden = false;
+  })();
+})();
+</script>
+</body>
+</html>

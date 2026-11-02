@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#141b29">
+<title>Inventário GMLC 360°</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+<header class="topo" id="topo" hidden>
+  <div class="topo-l1"><div><div class="rotulo">Oficina · CSN</div><h1 id="lote-nome">…</h1></div>
+    </div>
+</header>
+<main id="corpo"><div class="vazio">Carregando…</div></main>
+<div class="rodape" id="rodape" hidden><div>
+  <button type="button" class="btn btn-ns" id="btn-ns">Não sei o código</button>
+  <button type="button" class="btn btn-pri" id="btn-salvar">Salvar e próximo</button>
+</div></div>
+
+<div class="modal hidden" id="modal-nome"><div class="caixa">
+  <h2>Antes de começar</h2>
+  <p>Estamos identificando o material que veio da gerência para a oficina. Você vai ver <b>uma foto por vez</b>. Se o material for da sua área, preencha:</p>
+  <ul style="margin:0;padding-left:20px;color:var(--texto-2);font-size:.9rem;line-height:1.6"><li>o <b>nome</b> do material</li><li>o <b>código SAP</b></li><li><b>onde usa</b> (equipamento ou máquina)</li><li>a <b>quantidade</b>, se souber</li></ul>
+  <p>Depois toque em <b>Salvar e próximo</b>. Se não for da sua área ou não souber o código, toque em <b>Não sei o código</b> ou passe para o lado com o dedo.</p>
+  <label>Seu nome<input id="nome-pessoa" autocomplete="name" placeholder="Ex.: João Silva" maxlength="50"></label>
+  <label>Sua matrícula<input id="matricula-pessoa" autocomplete="off" autocapitalize="characters" placeholder="Ex.: CSP1234" maxlength="20"></label>
+  <button type="button" class="btn btn-pri" id="nome-ok">Começar</button>
+</div></div>
+<div class="zoom-tela hidden" id="zoom"><img alt="Foto ampliada"><button type="button" aria-label="Fechar">✕</button></div>
+<div class="aviso hidden" id="aviso" role="status"></div>
+
+<script>
+(() => {
+  let token = new URLSearchParams(location.search).get('t') || '';
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const n3 = n => String(n).padStart(3, '0');
+  const ler = k => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
+  const gravar = (k, v) => { try { localStorage.setItem(k, v); } catch { /* sem armazenamento: pede o nome de novo */ } };
+  let API = '', LOTE = null, ITENS = [], RESUMO = null, UNIDADES = [], ATUAL = 0, MODO = 'item', UNID = '', SALVANDO = false;
+
+  async function base() {
+    if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+      try { const r = await fetch('http://localhost:8000/', { signal: AbortSignal.timeout(1500) }); if (r.ok) return 'http://localhost:8000'; } catch { /* segue */ }
+    }
+    return 'https://api-oms-csn.onrender.com';
+  }
+  const fotoUrl = i => `${API}/api/inventario/publico/${encodeURIComponent(token)}/foto/${i.id}?r=${i.foto_rev || 0}`;
+  const NOME_UNID = { CDA: 'CDA (cada)', L: 'Litro', KG: 'Kg', M: 'Metro', 'pç': 'Peça', m: 'Metro', cx: 'Caixa', kg: 'Kg', rolo: 'Rolo', par: 'Par', jogo: 'Jogo', l: 'Litro' }; // SAP: CDA, L, KG, M
+  const situacao = i => ((i.codigo_sap || '').trim() ? 'ok' : i.nao_sei ? 'ns' : 'falta');
+  
+  let timerAviso;
+  function avisar(t) { const a = $('aviso'); a.textContent = t; a.classList.remove('hidden'); clearTimeout(timerAviso); timerAviso = setTimeout(() => a.classList.add('hidden'), 2600); }
+
+
+  function desenharItem() {
+    const i = ITENS[ATUAL];
+    if (!i) { $('corpo').innerHTML = '<div class="vazio"><b>Nenhum material aqui ainda.</b>As fotos aparecem quando a oficina cadastrar.</div>'; $('rodape').hidden = true; return; }
+    UNID = i.unidade || '';
+    const sit = situacao(i);
+    const st = sit === 'ok' ? `<div class="status ok">✓ Preenchido por ${esc(i.preenchido_por)}${i.preenchido_em ? ` em ${esc(i.preenchido_em.slice(8, 10))}/${esc(i.preenchido_em.slice(5, 7))}` : ''}. Pode corrigir se precisar.</div>`
+      : sit === 'ns' ? `<div class="status ns">${esc(i.preenchido_por)} não soube o código. Se você souber, preencha.</div>` : '';
+    const outra = i.n_respostas > 0 ? `<div class="status">Já tem ${i.n_respostas} resposta${i.n_respostas === 1 ? '' : 's'}. Se a sua for diferente, salve do mesmo jeito: todas ficam guardadas para a oficina conferir.</div>` : '';
+    $('corpo').innerHTML = `
+      <div class="nav"><div class="num">${n3(i.numero)}<small>${ATUAL + 1} de ${ITENS.length}</small></div>
+        <div class="setas"><button type="button" class="seta" id="ant" aria-label="Anterior"${ATUAL === 0 ? ' disabled' : ''}>‹</button><button type="button" class="seta" id="prox" aria-label="Próximo"${ATUAL >= ITENS.length - 1 ? ' disabled' : ''}>›</button></div></div>
+      <div class="foto"><img src="${fotoUrl(i)}" alt="Foto do material ${n3(i.numero)}" id="foto-img"><button type="button" class="zoom" id="btn-zoom">Ampliar</button></div>
+      <div class="girar"><button type="button" id="g180">↕ Virar de cabeça para cima</button><button type="button" id="g90">↻ Girar de lado</button></div>
+      ${st}${outra}
+      <form id="form" autocomplete="off">
+        <label>Nome do material<input id="f-nome" value="${esc(i.nome)}" placeholder="Ex.: Mangueira hidráulica 1/2&quot;" maxlength="200"></label>
+        <label>Código SAP<input id="f-codigo" value="${esc(i.codigo_sap)}" inputmode="numeric" placeholder="Ex.: 10023456" maxlength="30"></label>
+        <label>Onde usa <small>equipamento, máquina ou sistema</small><input id="f-onde" value="${esc(i.onde_usa)}" placeholder="Ex.: Molde MCC 4, hidráulica do segmento" maxlength="300"></label>
+        <div class="qtd"><label>Quantidade<input id="f-qtd" type="number" inputmode="decimal" min="0" step="any" value="${i.quantidade ?? ''}" placeholder="0"></label>
+          <label>Unidade<div class="unid" id="f-unid">${UNIDADES.map(u => `<button type="button" data-u="${esc(u)}" class="${UNID === u ? 'on' : ''}">${esc(NOME_UNID[u] || u)}</button>`).join('')}</div></label></div>
+        <details${i.observacao ? ' open' : ''}><summary>Observação (opcional)</summary><textarea id="f-obs" maxlength="500" placeholder="Ex.: falta a vedação, só serve no lado A">${esc(i.observacao)}</textarea></details>
+      </form>`;
+    $('rodape').hidden = false;
+    $('ant').onclick = () => ir(ATUAL - 1);
+    $('prox').onclick = () => ir(ATUAL + 1);
+    $('g180').onclick = () => girar(180);
+    $('g90').onclick = () => girar(90);
+    $('btn-zoom').onclick = $('foto-img').onclick = () => { const z = $('zoom'); z.querySelector('img').src = fotoUrl(i); z.classList.remove('hidden'); };
+    $('f-unid').onclick = e => { const b = e.target.closest('[data-u]'); if (!b) return; UNID = UNID === b.dataset.u ? '' : b.dataset.u; $('f-unid').querySelectorAll('button').forEach(x => x.classList.toggle('on', x.dataset.u === UNID)); };
+    $('form').onsubmit = e => { e.preventDefault(); salvar(false); };
+    // Já busca a próxima foto para não esperar.
+    const prox = ITENS[ATUAL + 1]; if (prox) new Image().src = fotoUrl(prox);
+  }
+
+  // Gira a foto no celular e troca no servidor (a foto fica certa para todo mundo).
+  let GIRANDO = false;
+  async function girar(graus) {
+    if (GIRANDO) return;
+    const i = ITENS[ATUAL]; if (!i) return;
+    GIRANDO = true; const b1 = $('g90'), b2 = $('g180'); b1.disabled = b2.disabled = true;
+    try {
+      // cache:'reload' — a cópia do <img> no cache não tem o cabeçalho que o canvas exige.
+      const resp = await fetch(fotoUrl(i), { cache: 'reload' }); if (!resp.ok) throw new Error('foto não carregou');
+      const img = await createImageBitmap(await resp.blob());
+      const c = document.createElement('canvas'), lado = graus === 90;
+      c.width = lado ? img.height : img.width; c.height = lado ? img.width : img.height;
+      const x = c.getContext('2d'); x.translate(c.width / 2, c.height / 2); x.rotate(graus * Math.PI / 180); x.drawImage(img, -img.width / 2, -img.height / 2);
+      const r = await fetch(`${API}/api/inventario/publico/${encodeURIComponent(token)}/itens/${i.id}/foto`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ foto: c.toDataURL('image/jpeg', 0.8) }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `Erro ${r.status}`);
+      i.foto_rev = d.foto_rev; $('foto-img').src = fotoUrl(i);
+    } catch (e) { avisar(`Não girou: ${e.message}`); }
+    finally { GIRANDO = false; b1.disabled = b2.disabled = false; }
+  }
+
+  function ir(idx) { if (idx < 0 || idx >= ITENS.length) return; ATUAL = idx; MODO = 'item'; desenhar(); scrollTo(0, 0); }
+  function proximoQueFalta(de) {
+    for (let k = 1; k <= ITENS.length; k++) { const j = (de + k) % ITENS.length; if (situacao(ITENS[j]) === 'falta') return j; }
+    return -1;
+  }
+
+
+  function desenhar() {
+    desenharItem(); // a página pública só mostra a foto e os campos; contadores e lista ficam no painel do ADM
+  }
+
+  async function salvar(naoSei) {
+    if (SALVANDO) return;
+    const i = ITENS[ATUAL]; if (!i) return;
+    const nome = $('f-nome').value.trim(), codigo = $('f-codigo').value.trim();
+    const qtdTxt = $('f-qtd').value.trim();
+    if (!naoSei && !codigo) return avisar('Coloque o código SAP ou toque em "Não sei o código".');
+    if (qtdTxt && !(Number(qtdTxt) >= 0)) return avisar('Quantidade inválida.');
+    const por = ler('inv_pessoa'); if (!por) return pedirNome();
+    SALVANDO = true; $('btn-salvar').disabled = $('btn-ns').disabled = true;
+    try {
+      const r = await fetch(`${API}/api/inventario/publico/${encodeURIComponent(token)}/itens/${i.id}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nome, codigo_sap: naoSei ? '' : codigo, onde_usa: $('f-onde').value.trim(), quantidade: qtdTxt ? Number(qtdTxt) : null, unidade: UNID, observacao: ($('f-obs')?.value || '').trim(), nao_sei: !!naoSei, por }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `Erro ${r.status}`);
+      ITENS[ATUAL] = d.item; RESUMO = d.resumo;
+      avisar(naoSei ? `${n3(i.numero)} marcado como "não sei".` : `${n3(i.numero)} salvo.`);
+      const j = proximoQueFalta(ATUAL);
+      if (j === -1) { avisar('Pronto! Não falta nenhum. Obrigado.'); desenhar(); }
+      else ir(j);
+    } catch (e) { avisar(`Não salvou: ${e.message}. Confira a internet e tente de novo.`); }
+    finally { SALVANDO = false; $('btn-salvar').disabled = $('btn-ns').disabled = false; }
+  }
+
+  function pedirNome() {
+    $('modal-nome').classList.remove('hidden');
+    const [, n = '', m = ''] = ler('inv_pessoa').match(/^(.*) \((.*)\)$/) || []; $('nome-pessoa').value = n; $('matricula-pessoa').value = m;
+    setTimeout(() => $('nome-pessoa').focus(), 50);
+  }
+
+  async function iniciar() {
+    API = await base();
+    // Sem link (botão da tela de login): abre o inventário aberto; se houver mais de um, deixa escolher.
+    if (!token) {
+      let abertos = [];
+      try { const r = await fetch(`${API}/api/inventario/abertos`, { cache: 'no-store' }); if (r.ok) abertos = await r.json(); } catch { /* sem rede */ }
+      if (!abertos.length) { $('corpo').innerHTML = '<div class="vazio"><b>Nenhum inventário aberto agora.</b>Se o servidor estava dormindo, espere uns segundos e recarregue.</div>'; return; }
+      if (abertos.length > 1) {
+        $('corpo').innerHTML = `<div class="rotulo" style="margin-bottom:10px">Qual inventário?</div>${abertos.map(l => `<a class="btn" style="display:flex;align-items:center;justify-content:space-between;text-decoration:none;margin-bottom:8px;color:var(--texto)" href="?t=${encodeURIComponent(l.token)}"><span>${esc(l.nome)}</span><small style="color:var(--texto-3)">${l.resumo.faltam} faltam</small></a>`).join('')}`;
+        return;
+      }
+      token = abertos[0].token;
+      history.replaceState(null, '', `?t=${encodeURIComponent(token)}`);
+    }
+    try {
+      const r = await fetch(`${API}/api/inventario/publico/${encodeURIComponent(token)}`, { cache: 'no-store' });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `Erro ${r.status}`);
+      LOTE = d.lote; ITENS = d.itens; RESUMO = d.resumo; UNIDADES = d.unidades || [];
+    } catch (e) {
+      $('corpo').innerHTML = `<div class="vazio"><b>Não abriu.</b>${esc(e.message)}<br>Se o servidor estava dormindo, espere uns segundos e recarregue a página.</div>`;
+      return;
+    }
+    $('topo').hidden = false;
+    $('lote-nome').textContent = LOTE.nome;
+    document.title = LOTE.nome;
+    const pedido = Number(new URLSearchParams(location.search).get('i')) || 0;
+    const jPedido = pedido ? ITENS.findIndex(x => x.id === pedido) : -1;
+    const j = proximoQueFalta(-1); ATUAL = jPedido >= 0 ? jPedido : (j === -1 ? 0 : j);
+    desenhar();
+    if (!ler('inv_pessoa')) pedirNome();
+  }
+
+  $('nome-ok').onclick = () => {
+    const n = $('nome-pessoa').value.trim(), m = $('matricula-pessoa').value.trim().toUpperCase();
+    if (n.length < 3) return avisar('Escreva seu nome.');
+    if (m.length < 3) return avisar('Escreva sua matrícula.');
+    gravar('inv_pessoa', `${n} (${m})`); $('modal-nome').classList.add('hidden');
+  };
+  ['nome-pessoa', 'matricula-pessoa'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') $('nome-ok').click(); }));
+  // Passar de lado com o dedo: arrastar para a esquerda = próxima, para a direita = anterior.
+  let tx = 0, ty = 0;
+  document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; ty = e.touches[0].clientY; }, { passive: true });
+  document.addEventListener('touchend', e => {
+    if (MODO !== 'item' || e.target.closest('input, textarea, .unid, .zoom-tela')) return;
+    const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
+    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.6) ir(ATUAL + (dx < 0 ? 1 : -1));
+  }, { passive: true });
+  $('btn-salvar').onclick = () => salvar(false);
+  $('btn-ns').onclick = () => salvar(true);
+  $('zoom').onclick = () => $('zoom').classList.add('hidden');
+  iniciar();
+})();
+</script>
+</body>
+</html>
