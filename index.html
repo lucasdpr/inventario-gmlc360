@@ -146,17 +146,10 @@
   }
 
   async function iniciar() {
-    // Sem link (botão da tela de login): abre o inventário aberto; se houver mais de um, deixa escolher.
+    // Sem link não há acesso: o token do link é o que protege o inventário.
     if (!token) {
-      let abertos = [];
-      try { abertos = await SB.rpc('inv_abertos'); } catch { /* sem rede */ }
-      if (!abertos.length) { $('corpo').innerHTML = '<div class="vazio"><b>Nenhum inventário aberto agora.</b>Confira a internet e recarregue.</div>'; return; }
-      if (abertos.length > 1) {
-        $('corpo').innerHTML = `<div class="rotulo" style="margin-bottom:10px">Qual inventário?</div>${abertos.map(l => `<a class="btn" style="display:flex;align-items:center;justify-content:space-between;text-decoration:none;margin-bottom:8px;color:var(--texto)" href="?t=${encodeURIComponent(l.token)}"><span>${esc(l.nome)}</span><small style="color:var(--texto-3)">${l.resumo.faltam} faltam</small></a>`).join('')}`;
-        return;
-      }
-      token = abertos[0].token;
-      history.replaceState(null, '', `?t=${encodeURIComponent(token)}`);
+      $('corpo').innerHTML = '<div class="vazio"><b>Abra pelo link do inventário.</b>Peça o link ao seu supervisor.</div>';
+      return;
     }
     try {
       const d = await SB.rpc('inv_publico', { p_token: token });
